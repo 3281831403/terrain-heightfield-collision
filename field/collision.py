@@ -26,6 +26,7 @@ All functions raise :class:`TerrainError` on an invalid field; they never leak
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
 __all__ = [
     "TOL",
@@ -43,9 +44,44 @@ __all__ = [
 #: Absolute tolerance used for every floating point comparison in this module.
 TOL = 1e-6
 
+_MISSING = object()
+
 
 class TerrainError(ValueError):
     """Raised when a height field, body or config violates the documented contract."""
+
+
+# ---------------------------------------------------------------------------
+# small validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_finite_number(value) -> bool:
+    """True for real, finite numbers (``bool`` is deliberately excluded)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
+
+
+def _finite(value, name: str) -> float:
+    if not _is_finite_number(value):
+        raise TerrainError(f"{name} must be a finite number")
+    return float(value)
+
+
+def _vector(value, length: int, name: str) -> list[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        raise TerrainError(f"{name} must be a sequence of {length} finite numbers")
+    return [_finite(component, f"{name}[{index}]") for index, component in enumerate(value)]
+
+
+def _require_valid(field) -> None:
+    problems = validate_field(field)
+    if problems:
+        raise TerrainError("invalid height field: " + "; ".join(problems))
 
 
 def validate_field(field) -> list[str]:
@@ -68,7 +104,219 @@ def validate_field(field) -> list[str]:
     Returns:
         list[str]: problems, empty when the field is valid.
     """
-    raise NotImplementedError("validate_field is not implemented")
+    if not isinstance(field, Mapping):
+        return ["field must be a mapping"]
+
+    problems: list[str] = []
+
+    spacing = field.get("spacing", _MISSING)
+    if spacing is _MISSING:
+        problems.append("spacing is missing")
+    elif not _is_finite_number(spacing):
+        problems.append("spacing must be a finite number")
+    elif float(spacing) <= 0.0:
+        problems.append("spacing must be greater than zero")
+
+    origin = field.get("origin", _MISSING)
+    if origin is _MISSING:
+        problems.append("origin is missing")
+    elif not isinstance(origin, (list, tuple)) or len(origin) != 2:
+        problems.append("origin must be a pair of finite numbers [x, z]")
+    else:
+        for index, value in enumerate(origin):
+            if not _is_finite_number(value):
+                problems.append(f"origin[{index}] must be a finite number")
+
+    heights = field.get("heights", _MISSING)
+    if heights is _MISSING:
+        problems.append("heights is missing")
+    elif not isinstance(heights, (list, tuple)):
+        problems.append("heights must be a list of rows")
+    elif len(heights) == 0:
+        problems.append("heights must not be empty")
+    else:
+        expected_len = None
+        for iz, row in enumerate(heights):
+            if not isinstance(row, (list, tuple)):
+                problems.append(f"heights[{iz}] must be a list of numbers")
+                continue
+            if len(row) == 0:
+                problems.append(f"heights[{iz}] must not be empty")
+            if expected_len is None:
+                expected_len = len(row)
+            elif len(row) != expected_len:
+                problems.append(
+                    f"heights[{iz}] has {len(row)} samples, expected {expected_len} (ragged grid)"
+                )
+            for ix, value in enumerate(row):
+                if not _is_finite_number(value):
+                    problems.append(f"heights[{iz}][{ix}] must be a finite number")
+
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# internal layout / sampling primitives (callers have validated already)
+# ---------------------------------------------------------------------------
+
+
+def _layout(field):
+    """Validate ``field`` and return ``(x0, z0, spacing, heights, nx, nz)``."""
+    _require_valid(field)
+    heights = field["heights"]
+    nx = len(heights[0])
+    nz = len(heights)
+    return (
+        float(field["origin"][0]),
+        float(field["origin"][1]),
+        float(field["spacing"]),
+        heights,
+        nx,
+        nz,
+    )
+
+
+def _nearest_index(grid_coord: float, count: int) -> int:
+    """Nearest sample index, clamped to ``[0, count - 1]``."""
+    index = int(math.floor(grid_coord + 0.5))
+    if index < 0:
+        return 0
+    if index > count - 1:
+        return count - 1
+    return index
+
+
+def _clamp_to_extent(world: float, origin: float, spacing: float, count: int) -> float:
+    """Grid coordinate of ``world`` clamped to the sample extent."""
+    grid_coord = (world - origin) / spacing
+    maximum = float(count - 1)
+    if grid_coord < 0.0:
+        return 0.0
+    if grid_coord > maximum:
+        return maximum
+    return grid_coord
+
+
+def _sample_height(layout, x: float, z: float) -> float:
+    """Bilinear height for an already validated ``layout``."""
+    x0, z0, spacing, heights, nx, nz = layout
+
+    gx = _clamp_to_extent(x, x0, spacing, nx)
+    gz = _clamp_to_extent(z, z0, spacing, nz)
+
+    if nx == 1:
+        ix0 = ix1 = 0
+        fx = 0.0
+    else:
+        ix0 = int(math.floor(gx))
+        if ix0 > nx - 2:
+            ix0 = nx - 2
+        ix1 = ix0 + 1
+        fx = gx - ix0
+
+    if nz == 1:
+        iz0 = iz1 = 0
+        fz = 0.0
+    else:
+        iz0 = int(math.floor(gz))
+        if iz0 > nz - 2:
+            iz0 = nz - 2
+        iz1 = iz0 + 1
+        fz = gz - iz0
+
+    row0 = heights[iz0]
+    row1 = heights[iz1]
+    h00 = float(row0[ix0])
+    h10 = float(row0[ix1])
+    h01 = float(row1[ix0])
+    h11 = float(row1[ix1])
+
+    return (
+        h00 * (1.0 - fx) * (1.0 - fz)
+        + h10 * fx * (1.0 - fz)
+        + h01 * (1.0 - fx) * fz
+        + h11 * fx * fz
+    )
+
+
+def _gradient(layout, x: float, z: float) -> tuple[float, float]:
+    """``(dh/dx, dh/dz)`` in meters per meter for an already validated layout."""
+    x0, z0, spacing, heights, nx, nz = layout
+
+    gx = _clamp_to_extent(x, x0, spacing, nx)
+    gz = _clamp_to_extent(z, z0, spacing, nz)
+    ix = _nearest_index(gx, nx)
+    iz = _nearest_index(gz, nz)
+
+    if nx == 1:
+        dh_dx = 0.0
+    elif ix == 0:
+        dh_dx = (heights[iz][1] - heights[iz][0]) / spacing
+    elif ix == nx - 1:
+        dh_dx = (heights[iz][nx - 1] - heights[iz][nx - 2]) / spacing
+    else:
+        dh_dx = (heights[iz][ix + 1] - heights[iz][ix - 1]) / (2.0 * spacing)
+
+    if nz == 1:
+        dh_dz = 0.0
+    elif iz == 0:
+        dh_dz = (heights[1][ix] - heights[0][ix]) / spacing
+    elif iz == nz - 1:
+        dh_dz = (heights[nz - 1][ix] - heights[nz - 2][ix]) / spacing
+    else:
+        dh_dz = (heights[iz + 1][ix] - heights[iz - 1][ix]) / (2.0 * spacing)
+
+    return dh_dx, dh_dz
+
+
+def _sample_normal(layout, x: float, z: float) -> list[float]:
+    """Unit normal for an already validated layout."""
+    dh_dx, dh_dz = _gradient(layout, x, z)
+    length = math.sqrt(dh_dx * dh_dx + 1.0 + dh_dz * dh_dz)
+    return [-dh_dx / length, 1.0 / length, -dh_dz / length]
+
+
+def _resolve_sphere(layout, center, radius: float) -> dict:
+    """Resolve a validated sphere against an already validated layout."""
+    original = [float(center[0]), float(center[1]), float(center[2])]
+
+    normal = _sample_normal(layout, original[0], original[2])
+    height = _sample_height(layout, original[0], original[2])
+    distance = (original[1] - height) * normal[1]
+
+    if distance >= radius - TOL:
+        return {"center": original, "penetration": 0.0, "corrected": False}
+
+    penetration = max(0.0, radius - distance)
+    current = list(original)
+
+    # Moving along the surface normal shifts x/z too, which changes the sampled
+    # height underneath the sphere; repeat until the perpendicular distance is
+    # the radius.  On flat or planar ground the first step is already exact.
+    for _ in range(64):
+        normal = _sample_normal(layout, current[0], current[2])
+        height = _sample_height(layout, current[0], current[2])
+        distance = (current[1] - height) * normal[1]
+        gap = radius - distance
+        if abs(gap) <= TOL:
+            break
+        current = [
+            current[0] + gap * normal[0],
+            current[1] + gap * normal[1],
+            current[2] + gap * normal[2],
+        ]
+
+    moved = math.dist(original, current)
+    return {
+        "center": current,
+        "penetration": penetration,
+        "corrected": moved > TOL,
+    }
+
+
+# ---------------------------------------------------------------------------
+# public API
+# ---------------------------------------------------------------------------
 
 
 def sample_height(field, x, z) -> float:
@@ -96,7 +344,8 @@ def sample_height(field, x, z) -> float:
         TerrainError: if ``validate_field(field)`` is non-empty (for example a
             ``spacing`` of ``0`` would divide by zero inside the interpolation).
     """
-    raise NotImplementedError("sample_height is not implemented")
+    layout = _layout(field)
+    return _sample_height(layout, _finite(x, "x"), _finite(z, "z"))
 
 
 def sample_normal(field, x, z) -> list[float]:
@@ -122,7 +371,8 @@ def sample_normal(field, x, z) -> list[float]:
     Raises:
         TerrainError: if ``validate_field(field)`` is non-empty.
     """
-    raise NotImplementedError("sample_normal is not implemented")
+    layout = _layout(field)
+    return _sample_normal(layout, _finite(x, "x"), _finite(z, "z"))
 
 
 def slope_deg(field, x, z) -> float:
@@ -145,7 +395,9 @@ def slope_deg(field, x, z) -> float:
     Raises:
         TerrainError: if ``validate_field(field)`` is non-empty.
     """
-    raise NotImplementedError("slope_deg is not implemented")
+    layout = _layout(field)
+    dh_dx, dh_dz = _gradient(layout, _finite(x, "x"), _finite(z, "z"))
+    return math.degrees(math.atan(math.hypot(dh_dx, dh_dz)))
 
 
 def raycast(field, origin, dir, max_dist) -> dict:
@@ -176,7 +428,61 @@ def raycast(field, origin, dir, max_dist) -> dict:
             ``dir``, ``max_dist`` are malformed (zero-length ``dir``, negative
             ``max_dist``).
     """
-    raise NotImplementedError("raycast is not implemented")
+    layout = _layout(field)
+    ox, oy, oz = _vector(origin, 3, "origin")
+    dx, dy, dz = _vector(dir, 3, "dir")
+    max_dist = _finite(max_dist, "max_dist")
+
+    length = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if length == 0.0:
+        raise TerrainError("dir must not be the zero vector")
+    if max_dist < 0.0:
+        raise TerrainError("max_dist must not be negative")
+
+    dx /= length
+    dy /= length
+    dz /= length
+
+    def end_point(distance: float) -> list[float]:
+        return [ox + distance * dx, oy + distance * dy, oz + distance * dz]
+
+    def gap(distance: float) -> float:
+        """Vertical distance from the ray point to the terrain (positive = above)."""
+        px, py, pz = end_point(distance)
+        return py - _sample_height(layout, px, pz)
+
+    # Starting on or below the surface already intersects it at t = 0.
+    if gap(0.0) <= 0.0:
+        return {"hit": True, "t": 0.0, "point": end_point(0.0)}
+
+    spacing = layout[2]
+    step = 0.5 * spacing
+    count = int(math.ceil(max_dist / step)) if max_dist > 0.0 else 0
+
+    lo = 0.0
+    hi = None
+    for index in range(1, count + 1):
+        distance = min(index * step, max_dist)
+        if gap(distance) <= 0.0:
+            hi = distance
+            break
+        lo = distance
+        if distance >= max_dist:
+            break
+
+    if hi is None:
+        return {"hit": False, "t": max_dist, "point": end_point(max_dist)}
+
+    # Bisection: ``lo`` is above the surface, ``hi`` is below it.
+    while hi - lo > 1e-9:
+        mid = 0.5 * (lo + hi)
+        if gap(mid) > 0.0:
+            lo = mid
+        else:
+            hi = mid
+
+    distance = 0.5 * (lo + hi)
+    return {"hit": True, "t": distance, "point": end_point(distance)}
 
 
 def resolve_sphere(field, center, radius) -> dict:
@@ -204,7 +510,12 @@ def resolve_sphere(field, center, radius) -> dict:
         TerrainError: if ``validate_field(field)`` is non-empty, or ``center``
             is malformed or ``radius`` is negative.
     """
-    raise NotImplementedError("resolve_sphere is not implemented")
+    layout = _layout(field)
+    point = _vector(center, 3, "center")
+    radius = _finite(radius, "radius")
+    if radius < 0.0:
+        raise TerrainError("radius must not be negative")
+    return _resolve_sphere(layout, point, radius)
 
 
 def height_over_segment(field, a, b, steps) -> list[float]:
@@ -231,7 +542,19 @@ def height_over_segment(field, a, b, steps) -> list[float]:
         TerrainError: if ``validate_field(field)`` is non-empty, or ``a``, ``b``,
             ``steps`` are malformed (``steps < 1``, non-finite endpoints).
     """
-    raise NotImplementedError("height_over_segment is not implemented")
+    layout = _layout(field)
+    ax, az = _vector(a, 2, "a")
+    bx, bz = _vector(b, 2, "b")
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        raise TerrainError("steps must be an integer >= 1")
+    if steps < 1:
+        raise TerrainError("steps must be an integer >= 1")
+
+    heights: list[float] = []
+    for index in range(steps + 1):
+        t = index / steps
+        heights.append(_sample_height(layout, ax + (bx - ax) * t, az + (bz - az) * t))
+    return heights
 
 
 def collide_batch(field, bodies, config) -> dict:
@@ -265,4 +588,53 @@ def collide_batch(field, bodies, config) -> dict:
             ``config`` are not mappings in the expected shape.  Invalid bodies
             are reported through the ``ok``/``error`` result, not by raising.
     """
-    raise NotImplementedError("collide_batch is not implemented")
+    layout = _layout(field)
+
+    if not isinstance(config, Mapping):
+        raise TerrainError("config must be a mapping")
+    if not isinstance(bodies, (list, tuple)):
+        raise TerrainError("bodies must be a list of body mappings")
+
+    default_radius = config.get("radius", _MISSING)
+    resolved: list[dict] = []
+
+    for index, body in enumerate(bodies):
+        if not isinstance(body, Mapping):
+            return {
+                "ok": False,
+                "bodies": [],
+                "error": f"body {index} is not a mapping",
+            }
+
+        try:
+            center = _vector(body.get("center", _MISSING), 3, f"body {index} center")
+        except TerrainError as exc:
+            return {"ok": False, "bodies": [], "error": str(exc)}
+
+        radius_value = body.get("radius", _MISSING)
+        if radius_value is _MISSING:
+            radius_value = default_radius
+        try:
+            radius = _finite(radius_value, f"body {index} radius")
+        except TerrainError as exc:
+            return {"ok": False, "bodies": [], "error": str(exc)}
+        if radius <= 0.0:
+            return {
+                "ok": False,
+                "bodies": [],
+                "error": f"body {index} radius must be greater than zero",
+            }
+
+        # Resolved independently from its own position/radius - no shared
+        # sampling cache between bodies.
+        result = _resolve_sphere(layout, center, radius)
+        resolved.append(
+            {
+                "id": body.get("id"),
+                "radius": radius,
+                "center": result["center"],
+                "corrected": result["corrected"],
+            }
+        )
+
+    return {"ok": True, "bodies": resolved, "error": None}
